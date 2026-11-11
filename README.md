@@ -599,4 +599,4 @@ eas.json                    Cloud build profiles
 
 ## 📜 Attribution and Use
 
-Built by [Sonny Sangha](https://www.papareact.com/ztoh-form) as a teaching project. The code is provided under the [MIT License](LICENSE). Expo, Clerk and Convex are trademarks of their owners; this project is not an official product of any of them. Demo photos come from [picsum.photos](https://picsum.photos).
+Built by [Sonny Sangha](https://www.papareact.com/ztoh-form) as a teaching project. The code is provided under the [PolyForm Noncommercial License 1.0.0](LICENSE): free to read, run, change and share for learning and other noncommercial use. **Commercial use needs a separate written licence from Sonny Sangha.** Notices for the Expo template and other third-party material are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Expo, Clerk and Convex are trademarks of their owners; this project is not an official product of any of them. Demo photos come from [picsum.photos](https://picsum.photos).

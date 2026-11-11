@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CanvasCard } from '../types/canvas';
-import { focusViewport, keepCardVisible, placeCard, distanceToSegment, fitViewport, hitCard, hitStroke, pathToPoints, resizeViewport, screenToWorld, serializeStroke, simplifyStroke, worldToScreen, wrapCanvasText, zoomAtPoint } from './canvas-math';
+import { focusViewport, keepCardVisible, placeCard, distanceToSegment, fitViewport, hitCard, hitStroke, nearBounds, boundsOfPoints, pathToPoints, resizeViewport, screenToWorld, serializeStroke, simplifyStroke, worldToScreen, wrapCanvasText, zoomAtPoint } from './canvas-math';
 
 describe('canvas coordinate system', () => {
   it('round trips translated, zoomed and negative document coordinates', () => {
@@ -125,5 +125,26 @@ describe('visible card placement and camera', () => {
     expect(worldToScreen({ x: 740, y: 20 }, camera)).toEqual({ x: 180, y: 180 });
     expect(keepCardVisible({ x: 0, y: 0, scale: 1 }, card, size)).toEqual(camera);
     expect(keepCardVisible(camera, card, size)).toBe(camera);
+  });
+});
+
+describe('the eraser\'s quick test', () => {
+  const points = pathToPoints('M10 10L110 60L40 90');
+  const bounds = boundsOfPoints(points);
+  it('boxes a line by its outermost points', () => {
+    expect(bounds).toEqual({ x: 10, y: 10, width: 100, height: 80 });
+  });
+  it('lets through every point the full test would accept', () => {
+    for (let x = -20; x <= 140; x += 7) {
+      for (let y = -20; y <= 120; y += 7) {
+        if (hitStroke(points, { x, y }, 9)) expect(nearBounds(bounds, { x, y }, 9)).toBe(true);
+      }
+    }
+  });
+  it('turns away points beyond its reach, and lines with no points', () => {
+    expect(nearBounds(bounds, { x: 121, y: 50 }, 10)).toBe(false);
+    expect(nearBounds(bounds, { x: 120, y: 50 }, 10)).toBe(true);
+    expect(nearBounds(bounds, { x: 50, y: -1 }, 10)).toBe(false);
+    expect(nearBounds(null, { x: 10, y: 10 }, 100)).toBe(false);
   });
 });

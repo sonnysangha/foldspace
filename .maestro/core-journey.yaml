@@ -42,7 +42,11 @@ name: Core journey
 - assertVisible: "Erase ink"
 - assertVisible: "One finger draws.*"
 - takeScreenshot: 03-draw-mode
-- tapOn: "Draw"
+# The toolbar is still growing its pen buttons; a tap during that is dropped.
+- waitForAnimationToEnd
+- tapOn:
+    text: "Draw"
+    retryTapIfNoChange: true
 - assertNotVisible: "Erase ink"
 
 # A space is a card you step into. It gets a title, then it is just a canvas.
@@ -95,7 +99,10 @@ name: Core journey
     direction: UP
 - tapOn: "Spaces and cards"
 - inputText: "First"
-- assertVisible: "First idea, in ${output.space}"
+# Other spaces may hold a matching card too, so the result can be further down the list.
+- scrollUntilVisible:
+    element: "First idea, in ${output.space}"
+    direction: DOWN
 - takeScreenshot: 07-search
 
 # A result opens its canvas with the card open.
@@ -132,6 +139,13 @@ name: Core journey
 - assertVisible: "Send invite"
 - assertVisible: "No one has joined yet."
 - takeScreenshot: 09-share
+# The button is switched off until the invite has finished saving.
+- extendedWaitUntil:
+    visible:
+      id: "share-disable"
+      enabled: true
+    timeout: 8000
+- waitForAnimationToEnd
 - tapOn:
     id: "share-disable"
 - tapOn: "Stop"

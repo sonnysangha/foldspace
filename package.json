@@ -65,5 +65,6 @@
     "test:e2e": "maestro test .maestro/core-journey.yaml",
     "seed:demo": "node scripts/seed-demo.mjs"
   },
-  "private": true
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE"
 }

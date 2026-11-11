@@ -1,8 +1,10 @@
 import { useMutation } from 'convex/react';
+import { useMemo } from 'react';
 import { api } from '../../convex/_generated/api';
 import type { Id } from '../../convex/_generated/dataModel';
 import { getCanvasHistory, useCanvasHistory, useHistoryRegistry } from '@/components/canvas-history-provider';
 import type { CanvasCard, NewStroke } from '@/types/canvas';
+import { withCardLook, type CardLook } from '@/utils/card-look';
 
 type CardInput = Pick<CanvasCard, 'kind' | 'title' | 'body' | 'color' | 'x' | 'y' | 'width' | 'height'> & { imageStorageId?: Id<'_storage'>; canvasId?: Id<'canvases'>; url?: string; duration?: number; latitude?: number; longitude?: number };
 export type CardPatch = Partial<Pick<CanvasCard, 'color' | 'x' | 'y' | 'width' | 'height'>>;
@@ -11,8 +13,20 @@ export function useCanvasActions(canvasId: Id<'canvases'>) {
   const historyState = useCanvasHistory(canvasId);
   const histories = useHistoryRegistry();
   const create = useMutation(api.cards.create);
-  const editCard = useMutation(api.cards.edit);
-  const updateCard = useMutation(api.cards.update);
+  const saveEdit = useMutation(api.cards.edit);
+  const saveUpdate = useMutation(api.cards.update);
+  // A new colour or size shows on the card at once. Convex puts the saved canvas back in
+  // its place when the server answers, and takes the change away again if the save fails.
+  // A move is left out: the canvas already keeps a moved card where it was dropped.
+  const [editCard, updateCard] = useMemo(() => {
+    const show = (localStore: Parameters<Parameters<typeof saveEdit.withOptimisticUpdate>[0]>[0], { id, color, width, height }: { id: Id<'cards'> } & CardLook) => {
+      const canvas = localStore.getQuery(api.canvases.cards, { canvasId });
+      if (!canvas) return;
+      const shown = withCardLook(canvas, id, { color, width, height });
+      if (shown !== canvas) localStore.setQuery(api.canvases.cards, { canvasId }, shown);
+    };
+    return [saveEdit.withOptimisticUpdate(show), saveUpdate.withOptimisticUpdate(show)] as const;
+  }, [saveEdit, saveUpdate, canvasId]);
   const removeCard = useMutation(api.cards.remove);
   const restoreCard = useMutation(api.cards.restore);
   const createStroke = useMutation(api.strokes.create);

@@ -81,13 +81,56 @@ const NEW_TITLES: Record<Exclude<CanvasCard['kind'], 'image'>, string> = {
 
 type CaptureRequest = { id: number; canvasId: string; title: string };
 
+/** A camera read back from storage, or nothing if it is missing, malformed or out of range. */
+function savedViewport(value: string | null): Viewport | undefined {
+  try {
+    const saved = value ? JSON.parse(value) as Viewport : undefined;
+    return saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) && Number.isFinite(saved.scale) && saved.scale >= 0.2 && saved.scale <= 4 ? saved : undefined;
+  } catch { return undefined; }
+}
+
+/** A camera action is told apart from the one before it by when it was asked for. */
+const actionId = () => Date.now();
+
+/** Runs `work`, handing a failure to `failed` rather than throwing it on. */
+async function attempt(work: () => Promise<unknown>, failed: (error: unknown) => void) {
+  try { await work(); } catch (error) { failed(error); }
+}
+
+const voiceError = (error: unknown) => errorMessage(error, error instanceof Error ? error.message : 'Could not save this voice note.');
+const imageError = (error: unknown) => errorMessage(error, error instanceof Error ? error.message : 'Could not add that image.');
+
+/** Asks for a photo from the library. Null when the picker is closed without choosing one. */
+async function pickImage() {
+  const image = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9 });
+  if (image.canceled) return null;
+  return { uri: image.assets[0].uri, title: image.assets[0].fileName?.replace(/\.[^.]+$/, '').slice(0, 160) || 'An image to explore' };
+}
+
+/** The photo as a JPEG no larger than 1800 points on a side, ready to upload. */
+async function normalizedJpeg(uri: string) {
+  const context = ImageManipulator.manipulate(uri, { maxWidth: 1800, maxHeight: 1800 });
+  const normalized = await (await context.renderAsync()).saveAsync({ format: SaveFormat.JPEG, compress: 0.88 });
+  return new File(normalized.uri).bytes();
+}
+
+/** Writes a captured canvas to a file and offers it to the share sheet. */
+async function sharePng(image: string | null, title: string) {
+  if (!image) throw new Error('Could not create this image. Please try again.');
+  const file = new File(Paths.cache, `foldspace-${Date.now()}.png`);
+  file.create(); file.write(image, { encoding: 'base64' });
+  await Sharing.shareAsync(file.uri, { dialogTitle: title, mimeType: 'image/png' });
+}
+
 export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTitle = false, typeInPlace = false }: {
   canvasId: Id<'canvases'>; initialCardId?: string; initialView?: string; focusTitle?: boolean;
   /** Arrive already typing on `initialCardId` where it sits on the canvas, as a new note does. */
   typeInPlace?: boolean;
 }) {
   const { palette, type } = useTheme();
-  const result = useQuery(api.canvases.get, { canvasId });
+  // Cards and ink are read separately, so moving a card does not bring every line down again.
+  const result = useQuery(api.canvases.cards, { canvasId });
+  const savedInk = useQuery(api.canvases.strokes, { canvasId });
   const updateText = useMutation(api.cards.update);
   const setCardImage = useMutation(api.cards.setImage);
   const refreshLink = useAction(api.links.refresh);
@@ -143,11 +186,13 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
   const dropPoint = useRef({ x: 200, y: 200 });
   const insideCenter = useRef<{ canvasId: string; point: { x: number; y: number } } | null>(null);
   const pendingViewport = useRef<{ key: string; viewport: Viewport } | null>(null);
+  // Where the camera is now. Only read when the surface has to be rebuilt, so moving it renders nothing.
+  const latestViewport = useRef<{ key: string; viewport: Viewport } | null>(null);
   const viewportSave = useRef<ReturnType<typeof setTimeout> | null>(null);
   const viewportKey = `foldspace:camera:${user?.id}:${canvasId}`;
   const wide = (availableWidth || window.width - insets.left - insets.right) >= 560;
   const cards: CanvasCard[] = result?.cards ?? [];
-  const strokes: CanvasStroke[] = result?.strokes ?? [];
+  const strokes: CanvasStroke[] = savedInk ?? [];
   const selected = cards.find(card => card._id === selectedId) ?? null;
   const insideContext = !!selected && inspectorMode === 'inside' && !compactCanvas && !showOutline;
   const insideActions = useCanvasActions((selected?.childCanvasId ?? canvasId) as Id<'canvases'>);
@@ -179,11 +224,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
   useEffect(() => {
     let active = true;
     void AsyncStorage.getItem(viewportKey).then(value => {
-      if (!active) return;
-      try {
-        const saved = value ? JSON.parse(value) as Viewport : undefined;
-        setViewport(saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) && Number.isFinite(saved.scale) && saved.scale >= 0.2 && saved.scale <= 4 ? saved : undefined);
-      } catch { setViewport(undefined); }
+      if (active) setViewport(savedViewport(value));
     }).catch(() => { if (active) setViewport(undefined); });
     return () => { active = false; persistViewport(); };
   }, [viewportKey, persistViewport]);
@@ -210,7 +251,13 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     if (hidden) cancelCapture(capture.id, 'Sharing canceled because the canvas view changed. Try again from the view you want to share.');
   }, [capture, canvasId, wide, showTools, compactCanvas, selected, showOutline, insideContext, cancelCapture]);
 
-  const failure = (message: string) => { notice(message); setSurfaceEpoch(value => value + 1); };
+  const failure = (message: string) => {
+    notice(message);
+    // The surface is rebuilt after a failure; it starts again from where the camera was.
+    const camera = latestViewport.current;
+    if (camera?.key === viewportKey) setViewport(camera.viewport);
+    setSurfaceEpoch(value => value + 1);
+  };
   const openCard = (card: CanvasCard) => { dismissKeyboard(); void flush(); router.push({ pathname: '/canvas/[id]', params: { id: card.childCanvasId } }); };
   const inspectInside = (card: CanvasCard) => {
     dismissKeyboard(); void flush();
@@ -245,7 +292,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     setSelectedId(card?._id ?? null); setCompactCanvas(wide ? !card : true); setShowTools(false); setFocusTitleId(null);
   };
   const saveViewport = (next: Viewport) => {
-    setViewport(next);
+    latestViewport.current = { key: viewportKey, viewport: next };
     pendingViewport.current = { key: viewportKey, viewport: next };
     if (viewportSave.current) clearTimeout(viewportSave.current);
     viewportSave.current = setTimeout(persistViewport, 180);
@@ -259,7 +306,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     dismissKeyboard();
     revealCanvas(activeCanvasId);
     setCameraCanvasId(activeCanvasId);
-    setCameraAction({ id: Date.now(), kind, cardId });
+    setCameraAction({ id: actionId(), kind, cardId });
   };
   const layoutFor = (target: string) => target !== canvasId ? {
     cards: insideCards,
@@ -290,7 +337,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     const { title = NEW_TITLES[kind], at, body, ...fields } = extra;
     // Links and voice notes arrive finished, so they are placed without opening the editor.
     const opens = kind !== 'link' && kind !== 'audio';
-    try {
+    await attempt(async () => {
       void flush();
       // A double-tap puts the card under the finger; otherwise it goes in the nearest free spot.
       const point = at ? { x: at.x - size.width / 2, y: at.y - size.height / 2 } : placeCard(layout.cards, layout.center, size);
@@ -309,8 +356,8 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
       // The page is read in the background; its title and picture arrive on the card when ready.
       if (kind === 'link') void refreshLink({ id: card._id as Id<'cards'> }).catch(() => {});
       if (process.env.EXPO_OS === 'ios') void Haptics.selectionAsync();
-    } catch (error) { failure(errorMessage(error, 'Could not add a card. Try again.')); }
-    finally { adding.current = false; }
+    }, error => failure(errorMessage(error, 'Could not add a card. Try again.')));
+    adding.current = false;
   };
   const addPlace = () => { dismissKeyboard(); setPrompt('place'); };
   const placeFound = (place: FoundPlace) => {
@@ -319,25 +366,27 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
   };
   const startVoiceNote = async () => {
     dismissKeyboard();
-    try {
+    await attempt(async () => {
       if (!(await requestRecordingPermissionsAsync()).granted) { notice('Allow the microphone in Settings to record voice notes.'); return; }
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
       await recorder.prepareToRecordAsync();
       recorder.record();
-    } catch { notice('Could not start recording.'); }
+    }, () => notice('Could not start recording.'));
   };
   const finishVoiceNote = async (keep: boolean) => {
     const target = activeCanvasId;
     const seconds = recording.durationMillis / 1000;
-    try {
+    await attempt(async () => {
       setSavingVoice(true);
       await recorder.stop();
       await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
-      if (!keep || !recorder.uri) return;
-      const imageStorageId = await uploadFile(await new File(recorder.uri).bytes(), 'audio/mp4');
-      await addCard('audio', target, { duration: Math.max(0, Math.round(seconds * 10) / 10), imageStorageId });
-    } catch (error) { notice(errorMessage(error, error instanceof Error ? error.message : 'Could not save this voice note.')); }
-    finally { setSavingVoice(false); }
+      const uri = recorder.uri;
+      if (keep && uri) {
+        const imageStorageId = await uploadFile(await new File(uri).bytes(), 'audio/mp4');
+        await addCard('audio', target, { duration: Math.max(0, Math.round(seconds * 10) / 10), imageStorageId });
+      }
+    }, error => notice(voiceError(error)));
+    setSavingVoice(false);
   };
   const toggleItem = (card: CanvasCard, index: number) => {
     const body = toggleChecklistItem(card.body, index);
@@ -358,7 +407,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
   /** Paste: a picture becomes a photo, a web address becomes a link, and other text becomes a note. */
   const pasteCard = async () => {
     if (!result) return;
-    try {
+    await attempt(async () => {
       if (await Clipboard.hasImageAsync()) {
         const image = await Clipboard.getImageAsync({ format: 'jpeg', jpegQuality: 0.88 });
         if (image?.data) {
@@ -375,39 +424,38 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
       if (!text) { notice('Nothing to paste. Copy a link, some text or an image first.'); return; }
       if (/^(https?:\/\/)?[^\s/]+\.[^\s]{2,}$/i.test(text)) linkEntered(text);
       else await addCard('note', activeCanvasId, { title: text.split('\n')[0].slice(0, 80), body: text.includes('\n') || text.length > 80 ? text.slice(0, 8000) : '' });
-    } catch (error) { notice(errorMessage(error, error instanceof Error ? error.message : 'Could not paste that.')); }
+    }, error => notice(errorMessage(error, error instanceof Error ? error.message : 'Could not paste that.')));
   };
   const openLink = (url: string) => { void WebBrowser.openBrowserAsync(url).catch(() => notice('Could not open this link.')); };
   const importImage = async () => {
     if (!result || importing) return;
     const target = activeCanvasId;
     const layout = layoutFor(target);
-    try {
+    await attempt(async () => {
       dismissKeyboard(); setImporting(true);
-      const image = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9 });
-      if (image.canceled) return;
-      notice('Adding image…');
-      const context = ImageManipulator.manipulate(image.assets[0].uri, { maxWidth: 1800, maxHeight: 1800 });
-      const normalized = await (await context.renderAsync()).saveAsync({ format: SaveFormat.JPEG, compress: 0.88 });
-      const storageId = await uploadFile(await new File(normalized.uri).bytes(), 'image/jpeg');
-      const point = placeCard(layout.cards, layout.center, { width: 300, height: 320 });
-      const added = await activeActions.create({ canvasId: target, kind: 'image', title: image.assets[0].fileName?.replace(/\.[^.]+$/, '').slice(0, 160) || 'An image to explore', body: '', color: '#FFFFFF', ...point, width: 300, height: 320, imageStorageId: storageId });
-      if (target !== canvasId) router.push({ pathname: '/canvas/[id]', params: { id: target, card: added._id } });
-      else { setSelectedId(added._id); setCompactCanvas(true); setLastInteractedCanvasId(canvasId); setCameraCanvasId(canvasId); setCameraAction({ id: Date.now(), kind: 'focus', cardId: added._id }); }
-      notice('Image added');
-    } catch (error) { notice(errorMessage(error, error instanceof Error ? error.message : 'Could not add that image.')); }
-    finally { setImporting(false); }
+      const picked = await pickImage();
+      if (picked) {
+        notice('Adding image…');
+        const storageId = await uploadFile(await normalizedJpeg(picked.uri), 'image/jpeg');
+        const point = placeCard(layout.cards, layout.center, { width: 300, height: 320 });
+        const added = await activeActions.create({ canvasId: target, kind: 'image', title: picked.title, body: '', color: '#FFFFFF', ...point, width: 300, height: 320, imageStorageId: storageId });
+        if (target !== canvasId) router.push({ pathname: '/canvas/[id]', params: { id: target, card: added._id } });
+        else { setSelectedId(added._id); setCompactCanvas(true); setLastInteractedCanvasId(canvasId); setCameraCanvasId(canvasId); setCameraAction({ id: Date.now(), kind: 'focus', cardId: added._id }); }
+        notice('Image added');
+      }
+    }, error => notice(imageError(error)));
+    setImporting(false);
   };
-  const moveCard = async (id: string, x: number, y: number) => { try { await actions.edit(id, { x, y }); } catch { failure('Could not move the card. Try again.'); } };
-  const editSelected = async (patch: CardPatch, label: string) => { if (!selected) return; try { await actions.edit(selected._id, patch, label); } catch { failure('Could not update this card. Try again.'); } };
-  const saveStroke = async (stroke: NewStroke) => { try { await actions.draw(stroke); } catch { failure('Could not save this stroke. Please draw it again.'); } };
-  const eraseStroke = async (ids: string[]) => { try { await actions.erase(ids); } catch { failure('Could not erase this ink.'); } };
-  const undo = async () => { try { await activeActions.history.undo(); } catch { failure('Could not undo. Your action is still available to retry.'); } };
-  const redo = async () => { try { await activeActions.history.redo(); } catch { failure('Could not redo. Please try again.'); } };
+  const moveCard = async (id: string, x: number, y: number) => { await attempt(async () => { await actions.edit(id, { x, y }); }, () => { failure('Could not move the card. Try again.'); }); };
+  const editSelected = async (patch: CardPatch, label: string) => { if (!selected) return; await attempt(async () => { await actions.edit(selected._id, patch, label); }, () => { failure('Could not update this card. Try again.'); }); };
+  const saveStroke = async (stroke: NewStroke) => { await attempt(async () => { await actions.draw(stroke); }, () => { failure('Could not save this stroke. Please draw it again.'); }); };
+  const eraseStroke = async (ids: string[]) => { await attempt(async () => { await actions.erase(ids); }, () => { failure('Could not erase this ink.'); }); };
+  const undo = async () => { await attempt(async () => { await activeActions.history.undo(); }, () => { failure('Could not undo. Your action is still available to retry.'); }); };
+  const redo = async () => { await attempt(async () => { await activeActions.history.redo(); }, () => { failure('Could not redo. Please try again.'); }); };
   const nudge = async (dx: number, dy: number) => {
     if (!contextCard) return;
-    try { await activeActions.edit(contextCard._id, { x: Math.max(-100000, Math.min(100000, contextCard.x + dx)), y: Math.max(-100000, Math.min(100000, contextCard.y + dy)) }); revealCanvas(activeCanvasId); setCameraCanvasId(activeCanvasId); setCameraAction({ id: Date.now(), kind: 'focus', cardId: contextCard._id }); }
-    catch { failure('Could not move this card.'); }
+    await attempt(async () => { await activeActions.edit(contextCard._id, { x: Math.max(-100000, Math.min(100000, contextCard.x + dx)), y: Math.max(-100000, Math.min(100000, contextCard.y + dy)) }); revealCanvas(activeCanvasId); setCameraCanvasId(activeCanvasId); setCameraAction({ id: Date.now(), kind: 'focus', cardId: contextCard._id }); }
+    , () => failure('Could not move this card.'));
   };
   /** Deletes straight away. The notice and its Undo are the safety net, so there is no "are you sure". */
   const deleteSelected = (card?: CanvasCard) => {
@@ -457,15 +505,9 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     if (captureTimer.current) clearTimeout(captureTimer.current);
     captureTimer.current = null;
     setCapture(null);
-    void (async () => {
-      try {
-        if (!image) throw new Error('Could not create this image. Please try again.');
-        const file = new File(Paths.cache, `foldspace-${Date.now()}.png`);
-        file.create(); file.write(image, { encoding: 'base64' });
-        await Sharing.shareAsync(file.uri, { dialogTitle: request.title, mimeType: 'image/png' });
-      } catch (error) { notice(error instanceof Error ? error.message : 'Could not share this view.'); }
-      finally { setSharing(false); }
-    })();
+    void sharePng(image, request.title)
+      .catch((error: unknown) => notice(error instanceof Error ? error.message : 'Could not share this view.'))
+      .then(() => setSharing(false));
   }, [notice]);
   const shareCanvas = () => {
     if (!result || sharing) return;
@@ -480,7 +522,7 @@ export function WorkspaceScreen({ canvasId, initialCardId, initialView, focusTit
     if (!insideContext) setCompactCanvas(true);
   };
 
-  if (!result || viewport === null) return <LoadingView label="Opening…" />;
+  if (!result || savedInk === undefined || viewport === null) return <LoadingView label="Opening…" />;
   const goBack = () => { dismissKeyboard(); void flush(); if (router.canGoBack()) router.back(); else router.dismissTo('/'); };
   const parentCrumb = result.breadcrumbs.length > 1 ? result.breadcrumbs[result.breadcrumbs.length - 2] : null;
   /** One level out: the parent canvas, or from a space's top canvas, the library. */

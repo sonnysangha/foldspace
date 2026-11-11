@@ -12,6 +12,13 @@ export { paperColor } from '@/utils/paper-color';
 
 type PreviewFont = ReturnType<typeof matchFont>;
 
+/** One typeface for every thumbnail, looked up the first time one is drawn. */
+let sharedFont: PreviewFont | null = null;
+function previewFont() {
+  sharedFont ??= matchFont({ fontFamily: process.env.EXPO_OS === 'ios' ? 'Helvetica Neue' : 'sans-serif', fontSize: 18, fontWeight: '500' });
+  return sharedFont;
+}
+
 /** One card in a thumbnail: its paper and title, then its photo, or faint lines standing in for text. */
 const PreviewCard = memo(function PreviewCard({ card, font, palette }: { card: CanvasPreview['cards'][number]; font: PreviewFont; palette: Palette }) {
   const image = useCachedImage(card.imageUrl);
@@ -35,7 +42,7 @@ const PreviewCard = memo(function PreviewCard({ card, font, palette }: { card: C
 export const PreviewDrawing = memo(function PreviewDrawing({ preview, palette, width, height, padding = 14 }: {
   preview: CanvasPreview; palette: Palette; width: number; height: number; padding?: number;
 }) {
-  const font = useMemo(() => matchFont({ fontFamily: process.env.EXPO_OS === 'ios' ? 'Helvetica Neue' : 'sans-serif', fontSize: 18, fontWeight: '500' }), []);
+  const font = previewFont();
   const paths = useMemo(() => preview.strokes.map(stroke => ({ ...stroke, skPath: Skia.Path.MakeFromSVGString(stroke.path) })), [preview.strokes]);
   const bounds = useMemo(() => unionBounds([
     ...preview.cards.map(({ x, y, width, height }) => ({ x, y, width, height })),
@@ -53,10 +60,18 @@ export const PreviewDrawing = memo(function PreviewDrawing({ preview, palette, w
   </Group>;
 });
 
-export function CanvasPreviewCover({ preview, background, padding = 24 }: { preview: CanvasPreview; background?: string; padding?: number }) {
+export function CanvasPreviewCover({ preview, background, padding = 24, width = 0, height = 0 }: {
+  preview: CanvasPreview; background?: string; padding?: number;
+  /** The size the cover will be laid out at, when the parent already knows it, so the first frame draws. */
+  width?: number; height?: number;
+}) {
   const { palette } = useTheme();
-  const [size, setSize] = useState({ width: 0, height: 0 });
-  return <View pointerEvents="none" onLayout={event => setSize({ width: event.nativeEvent.layout.width, height: event.nativeEvent.layout.height })} style={{ flex: 1 }}>
+  const [size, setSize] = useState({ width: Math.max(0, width), height: Math.max(0, height) });
+  return <View pointerEvents="none" onLayout={event => {
+    const { width: nextWidth, height: nextHeight } = event.nativeEvent.layout;
+    // Layout rounds to whole pixels; a difference that small is not worth drawing again.
+    setSize(current => Math.abs(current.width - nextWidth) < 0.5 && Math.abs(current.height - nextHeight) < 0.5 ? current : { width: nextWidth, height: nextHeight });
+  }} style={{ flex: 1 }}>
     <Canvas style={{ flex: 1 }} opaque>
       <Fill color={background ?? palette.canvas} />
       <PreviewDrawing preview={preview} palette={palette} width={size.width} height={size.height} padding={padding} />

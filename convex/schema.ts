@@ -15,6 +15,12 @@ export default defineSchema({
     /** Set while the owner is sharing. Anyone signed in who has it can join. */
     shareCode: v.optional(v.string()),
     ownerName: v.optional(v.string()),
+    /**
+     * How many people have joined. Kept in step by every change to `members`, so listing
+     * spaces need not look there. Absent on spaces made before it existed; those are
+     * still answered from `members`.
+     */
+    memberCount: v.optional(v.number()),
     deleted: v.boolean(),
     createdAt: v.number(),
     updatedAt: v.number(),

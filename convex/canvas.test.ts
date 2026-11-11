@@ -352,3 +352,142 @@ describe('authenticated image upload', () => {
     expect((await alice.query(api.canvases.get, { canvasId: board.rootCanvasId })).cards[0].imageUrl).toBeTruthy();
   });
 });
+
+describe('a canvas read as cards and ink separately', () => {
+  const line = { path: 'M 0 0 L 50 50', color: '#123456', width: 3 };
+  it('returns between them exactly what the single read returns', async () => {
+    const { alice } = setup();
+    const board = await alice.mutation(api.workspaces.create, { title: 'Split', color: '#FFFFFF' });
+    const parent = await alice.mutation(api.cards.create, { ...note, kind: 'canvas', canvasId: board.rootCanvasId });
+    const other = await alice.mutation(api.cards.create, { ...note, title: 'Second', x: 500, canvasId: board.rootCanvasId });
+    await alice.mutation(api.cards.create, { ...note, title: 'Inside', canvasId: parent.childCanvasId });
+    await alice.mutation(api.connectors.toggle, { canvasId: board.rootCanvasId, fromCardId: parent._id, toCardId: other._id });
+    const strokeId = await alice.mutation(api.strokes.create, { canvasId: board.rootCanvasId, ...line });
+    const whole = await alice.query(api.canvases.get, { canvasId: board.rootCanvasId });
+    const cards = await alice.query(api.canvases.cards, { canvasId: board.rootCanvasId });
+    const strokes = await alice.query(api.canvases.strokes, { canvasId: board.rootCanvasId });
+    expect({ ...cards, strokes }).toEqual(whole);
+    expect('strokes' in cards).toBe(false);
+    expect(cards.cards).toHaveLength(2);
+    expect(cards.cards[0].preview?.cards.map((card: { title: string }) => card.title)).toEqual(['Inside']);
+    expect(cards.connectors).toHaveLength(1);
+    expect(strokes).toEqual([{ _id: strokeId, canvasId: board.rootCanvasId, ...line }]);
+    // Ink on another canvas of the same space stays on that canvas.
+    expect(await alice.query(api.canvases.strokes, { canvasId: parent.childCanvasId })).toEqual([]);
+    expect((await alice.query(api.canvases.cards, { canvasId: parent.childCanvasId })).breadcrumbs.map((item: { title: string }) => item.title)).toEqual(['Split', note.title]);
+    await alice.mutation(api.strokes.setDeleted, { canvasId: board.rootCanvasId, ids: [strokeId], deleted: true });
+    expect(await alice.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).toEqual([]);
+  });
+
+  it('is closed to strangers and to anyone signed out', async () => {
+    const { t, alice, bob } = setup();
+    const board = await alice.mutation(api.workspaces.create, { title: 'Private', color: '#FFFFFF' });
+    const card = await alice.mutation(api.cards.create, { ...note, canvasId: board.rootCanvasId });
+    await alice.mutation(api.strokes.create, { canvasId: board.rootCanvasId, ...line });
+    for (const canvasId of [board.rootCanvasId, card.childCanvasId]) {
+      await expect(bob.query(api.canvases.cards, { canvasId })).rejects.toThrow('unavailable');
+      await expect(bob.query(api.canvases.strokes, { canvasId })).rejects.toThrow('unavailable');
+      await expect(t.query(api.canvases.cards, { canvasId })).rejects.toThrow('Sign in');
+      await expect(t.query(api.canvases.strokes, { canvasId })).rejects.toThrow('Sign in');
+    }
+  });
+
+  it('opens to a member, shows the owner their edits, and closes when they are removed', async () => {
+    const { t, alice } = setup();
+    const carol = t.withIdentity({ subject: 'clerk-carol', name: 'Carol' });
+    const board = await alice.mutation(api.workspaces.create, { title: 'Trip', color: '#FFFFFF' });
+    const code = await alice.mutation(api.sharing.enable, { workspaceId: board._id });
+    await expect(carol.query(api.canvases.cards, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    await expect(carol.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    await carol.mutation(api.sharing.join, { code });
+    const added = await carol.mutation(api.cards.create, { ...note, title: 'From Carol', canvasId: board.rootCanvasId });
+    const drawn = await carol.mutation(api.strokes.create, { canvasId: board.rootCanvasId, ...line });
+    expect((await alice.query(api.canvases.cards, { canvasId: board.rootCanvasId })).cards.map((card: { _id: string }) => card._id)).toEqual([added._id]);
+    expect((await alice.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).map((stroke: { _id: string }) => stroke._id)).toEqual([drawn]);
+    expect((await carol.query(api.canvases.cards, { canvasId: board.rootCanvasId })).cards).toHaveLength(1);
+    expect(await carol.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).toHaveLength(1);
+    await alice.mutation(api.sharing.removeMember, { workspaceId: board._id, userId: 'clerk-carol' });
+    await expect(carol.query(api.canvases.cards, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    await expect(carol.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    await expect(carol.query(api.canvases.cards, { canvasId: added.childCanvasId })).rejects.toThrow('unavailable');
+  });
+
+  it('is closed below a deleted card and inside a deleted space', async () => {
+    const { alice } = setup();
+    const board = await alice.mutation(api.workspaces.create, { title: 'Going', color: '#FFFFFF' });
+    const card = await alice.mutation(api.cards.create, { ...note, canvasId: board.rootCanvasId });
+    await alice.mutation(api.strokes.create, { canvasId: card.childCanvasId, ...line });
+    await alice.mutation(api.cards.remove, { id: card._id });
+    await expect(alice.query(api.canvases.cards, { canvasId: card.childCanvasId })).rejects.toThrow('unavailable');
+    await expect(alice.query(api.canvases.strokes, { canvasId: card.childCanvasId })).rejects.toThrow('unavailable');
+    await alice.mutation(api.cards.restore, { id: card._id });
+    expect(await alice.query(api.canvases.strokes, { canvasId: card.childCanvasId })).toHaveLength(1);
+    await alice.mutation(api.workspaces.remove, { id: board._id });
+    await expect(alice.query(api.canvases.cards, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    await expect(alice.query(api.canvases.strokes, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+  });
+});
+
+describe('the tally of who has joined a space', () => {
+  const tally = (t: ReturnType<typeof setup>['t'], id: string) => t.run(async ctx => (await ctx.db.get(id as never) as { memberCount?: number } | null)?.memberCount ?? 'none');
+  it('follows joining, leaving, removal and closing the invite', async () => {
+    const { t, alice, bob } = setup();
+    const carol = t.withIdentity({ subject: 'clerk-carol', name: 'Carol' });
+    const board = await alice.mutation(api.workspaces.create, { title: 'Trip', color: '#FFFFFF' });
+    expect(await tally(t, board._id)).toBe(0);
+    expect((await alice.query(api.workspaces.list, {}))[0].shared).toBe(false);
+    const code = await alice.mutation(api.sharing.enable, { workspaceId: board._id });
+    await carol.mutation(api.sharing.join, { code });
+    await carol.mutation(api.sharing.join, { code });
+    expect(await tally(t, board._id)).toBe(1);
+    await bob.mutation(api.sharing.join, { code });
+    expect(await tally(t, board._id)).toBe(2);
+    await bob.mutation(api.sharing.leave, { workspaceId: board._id });
+    await bob.mutation(api.sharing.leave, { workspaceId: board._id });
+    expect(await tally(t, board._id)).toBe(1);
+    await alice.mutation(api.sharing.removeMember, { workspaceId: board._id, userId: 'clerk-carol' });
+    expect(await tally(t, board._id)).toBe(0);
+    await expect(carol.query(api.canvases.cards, { canvasId: board.rootCanvasId })).rejects.toThrow('unavailable');
+    expect(await carol.query(api.workspaces.list, {})).toEqual([]);
+    // The invite is still open, so the owner still sees the space as shared.
+    expect((await alice.query(api.workspaces.list, {}))[0].shared).toBe(true);
+    await carol.mutation(api.sharing.join, { code });
+    await alice.mutation(api.sharing.disable, { workspaceId: board._id });
+    expect(await tally(t, board._id)).toBe(0);
+    expect((await alice.query(api.workspaces.list, {}))[0].shared).toBe(false);
+  });
+
+  it('still answers for a space saved before the tally existed, and fills it in when asked', async () => {
+    const { t, alice } = setup();
+    const carol = t.withIdentity({ subject: 'clerk-carol', name: 'Carol' });
+    // A space as older versions stored it: no tally, no open invite, one person already in.
+    const old = await t.run(async ctx => {
+      const now = Date.now();
+      const _id = await ctx.db.insert('workspaces', { ownerId: 'clerk-alice', title: 'Older', color: '#FFFFFF', isDemo: false, deleted: false, createdAt: now, updatedAt: now });
+      const rootCanvasId = await ctx.db.insert('canvases', { workspaceId: _id, title: 'Older', parentCanvasId: null, parentCardId: null, depth: 0, cardCount: 0, strokeCount: 0, createdAt: now });
+      await ctx.db.patch(_id, { rootCanvasId });
+      await ctx.db.insert('members', { workspaceId: _id, userId: 'clerk-carol', name: 'Carol', joinedAt: now });
+      return { _id, rootCanvasId };
+    });
+    const alone = await t.run(async ctx => {
+      const now = Date.now();
+      const _id = await ctx.db.insert('workspaces', { ownerId: 'clerk-alice', title: 'Alone', color: '#FFFFFF', isDemo: false, deleted: false, createdAt: now, updatedAt: now - 1 });
+      const rootCanvasId = await ctx.db.insert('canvases', { workspaceId: _id, title: 'Alone', parentCanvasId: null, parentCardId: null, depth: 0, cardCount: 0, strokeCount: 0, createdAt: now });
+      await ctx.db.patch(_id, { rootCanvasId });
+      return _id;
+    });
+    const read = async () => Object.fromEntries((await alice.query(api.workspaces.list, {})).map((space: { title: string; shared: boolean }) => [space.title, space.shared]));
+    expect(await read()).toEqual({ Older: true, Alone: false });
+    expect((await carol.query(api.workspaces.list, {}))[0]).toMatchObject({ _id: old._id, role: 'member', shared: true });
+    expect((await carol.query(api.canvases.cards, { canvasId: old.rootCanvasId })).cards).toEqual([]);
+    expect(await tally(t, old._id)).toBe('none');
+    await t.mutation(internal.workspaces.backfillMemberCounts, {});
+    expect(await tally(t, old._id)).toBe(1);
+    expect(await tally(t, alone)).toBe(0);
+    expect(await read()).toEqual({ Older: true, Alone: false });
+    // Someone leaving an older space gives it a tally too.
+    await carol.mutation(api.sharing.leave, { workspaceId: old._id });
+    expect(await tally(t, old._id)).toBe(0);
+    expect(await read()).toEqual({ Older: false, Alone: false });
+  });
+});

@@ -1,4 +1,4 @@
-import type { CanvasCard, Viewport } from '../types/canvas';
+import type { Viewport } from '../types/canvas';
 
 export type Point = { x: number; y: number };
 export type Size = { width: number; height: number };
@@ -77,7 +77,7 @@ export function placeCard(cards: readonly Bounds[], center: Point, size: Size): 
   return origin;
 }
 
-export function hitCard(cards: readonly CanvasCard[], point: Point): string | null {
+export function hitCard(cards: readonly (Bounds & { _id: string })[], point: Point): string | null {
   'worklet';
   // Later cards paint above earlier ones, so hit testing follows that same order.
   for (let index = cards.length - 1; index >= 0; index -= 1) {
@@ -137,6 +137,13 @@ export function distanceToSegment(point: Point, start: Point, end: Point): numbe
     ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared,
   ));
   return Math.hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy));
+}
+
+/** Whether a point is inside a box, or within `reach` of it. A cheap first test before measuring against every segment of a line. */
+export function nearBounds(bounds: Bounds | null, point: Point, reach: number): boolean {
+  'worklet';
+  return !!bounds && point.x >= bounds.x - reach && point.x <= bounds.x + bounds.width + reach
+    && point.y >= bounds.y - reach && point.y <= bounds.y + bounds.height + reach;
 }
 
 export function hitStroke(points: readonly Point[], point: Point, tolerance: number): boolean {

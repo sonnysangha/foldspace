@@ -13,7 +13,7 @@ import {
   matchFont,
   useCanvasRef,
 } from '@shopify/react-native-skia';
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
 import { TextInput, View, type LayoutChangeEvent } from 'react-native';
 import {
   GestureDetector,
@@ -25,18 +25,19 @@ import {
 } from 'react-native-gesture-handler';
 import * as Haptics from 'expo-haptics';
 import { Link } from 'expo-router';
-import Animated, { Easing, useAnimatedStyle, useDerivedValue, useSharedValue, withTiming, type SharedValue } from 'react-native-reanimated';
+import Animated, { Easing, useAnimatedReaction, useAnimatedStyle, useDerivedValue, useSharedValue, withTiming, type SharedValue } from 'react-native-reanimated';
 import { scheduleOnRN } from 'react-native-worklets';
 
 import { paperColor, PreviewDrawing } from './canvas-preview';
 import { useCachedImage } from '@/hooks/use-cached-image';
 import { parseChecklist } from '@/utils/checklist';
+import { sameData } from '@/utils/stable';
+import { strokeGeometry } from '@/utils/stroke-geometry';
 import { formatDuration, waveform } from '@/utils/waveform';
 
 import { cardInk, lightPalette, spaceAccent, useTheme, type Palette } from '@/theme';
 import type { CanvasCard, CanvasConnector, CanvasStroke, CanvasSurfaceProps, NewStroke, Viewport } from '@/types/canvas';
 import {
-  boundsOfPoints,
   clampScale,
   connectorCurve,
   distanceToConnector,
@@ -45,13 +46,14 @@ import {
   focusViewport,
   hitCard,
   hitStroke,
-  pathToPoints,
   keepCardVisible,
   resizeViewport,
   screenToWorld,
   serializeStroke,
   unionBounds,
   wrapCanvasText,
+  nearBounds,
+  type Bounds,
   type Point,
   type Size,
 } from '@/utils/canvas-math';
@@ -61,8 +63,14 @@ type DragState = { id: string | null; x: number; y: number; ox: number; oy: numb
 const IDLE: DragState = { id: null, x: 0, y: 0, ox: 0, oy: 0 };
 /** How far to the right of a selected card its connect dot sits, in screen points. */
 const DOT_GAP = 20;
-type StrokeTarget = { id: string; points: Point[]; width: number };
+/** A saved line as the eraser sees it: its points, and the box round them for a quick first test. */
+type StrokeTarget = { id: string; points: Point[]; width: number; bounds: Bounds | null };
 type FontSet = ReturnType<typeof makeFonts>;
+/**
+ * What the gestures need to know about a card: where it is and whether it is a space.
+ * Its text, picture and preview stay behind, so they are not copied across to the UI thread.
+ */
+type SceneCard = Pick<CanvasCard, '_id' | 'kind' | 'x' | 'y' | 'width' | 'height'>;
 
 const NO_CONNECTORS: CanvasConnector[] = [];
 const NO_IDS: string[] = [];
@@ -77,6 +85,13 @@ const CHECK_ROW = 26;
  */
 const FLICK_MS = 350;
 const FLICK_SCALE = 0.8;
+
+/** The four typefaces are looked up once for the app, not once for every canvas that opens. */
+let sharedFonts: FontSet | null = null;
+function canvasFonts() {
+  sharedFonts ??= makeFonts();
+  return sharedFonts;
+}
 
 function makeFonts() {
   const fontFamily = process.env.EXPO_OS === 'ios' ? 'Helvetica Neue' : 'sans-serif';
@@ -119,21 +134,18 @@ const CardNode = memo(function CardNode({ card, selected, grouped, handles, edit
   const image = useCachedImage(card.kind === 'audio' ? null : card.kind === 'link' ? card.linkImage : card.imageUrl);
   // While a card is held it follows the finger. Once released it reads the position the
   // gesture left on the UI thread, so it cannot snap back for a frame while React catches up.
+  // Only the id and position go into the worklet; the rest of the card has no business on the UI thread.
+  const cardId = card._id, cardX = card.x, cardY = card.y;
   const transform = useDerivedValue(() => {
     const current = drag.get();
-    if (current.id === card._id) return [{ translateX: current.x }, { translateY: current.y }];
-    const placed = positions.get()[card._id] ?? card;
+    if (current.id === cardId) return [{ translateX: current.x }, { translateY: current.y }];
+    const placed = positions.get()[cardId];
+    const x = placed ? placed.x : cardX, y = placed ? placed.y : cardY;
     // Cards selected together travel with the one being dragged.
     const members = group.get();
-    const rides = current.id !== null && members.length > 1 && members.includes(card._id) && members.includes(current.id);
-    return [{ translateX: placed.x + (rides ? current.x - current.ox : 0) }, { translateY: placed.y + (rides ? current.y - current.oy : 0) }];
-  }, [card._id, card.x, card.y]);
-  // Handles keep the same size on screen however far the canvas is zoomed.
-  const dotX = useDerivedValue(() => card.width + DOT_GAP / view.get().scale, [card.width]);
-  const dotR = useDerivedValue(() => 10 / view.get().scale);
-  const gripR = useDerivedValue(() => 9 / view.get().scale);
-  const pipR = useDerivedValue(() => 3.5 / view.get().scale);
-  const hair = useDerivedValue(() => 2 / view.get().scale);
+    const rides = current.id !== null && members.length > 1 && members.includes(cardId) && members.includes(current.id);
+    return [{ translateX: x + (rides ? current.x - current.ox : 0) }, { translateY: y + (rides ? current.y - current.oy : 0) }];
+  }, [cardId, cardX, cardY]);
   const isSpace = card.kind === 'canvas';
   const titleLines = useMemo(() => wrapCanvasText(card.title || 'Untitled',
     (text) => fonts.title.measureText(text).width, card.width - 36, isSpace || card.kind === 'link' ? 1 : 2), [card.kind, card.title, card.width, fonts, isSpace]);
@@ -222,48 +234,69 @@ const CardNode = memo(function CardNode({ card, selected, grouped, handles, edit
         <Path path="M -9.5 0.5 L 0 18 L 9.5 0.5 Z" color={lightPalette.danger} />
         <Circle cx={0} cy={-10} r={5.5} color={cardInk.onInk} />
       </Group>}
-      {handles && <>
-        {/* Drag the dot to another card to connect them. */}
-        <Circle cx={dotX} cy={card.height / 2} r={dotR} color={palette.paper} />
-        <Circle cx={dotX} cy={card.height / 2} r={dotR} color={palette.ink} style="stroke" strokeWidth={hair} />
-        <Circle cx={dotX} cy={card.height / 2} r={pipR} color={palette.ink} />
-        {/* Drag the corner to resize. */}
-        <Circle cx={card.width + 2} cy={card.height + 2 + (isSpace ? 8 : 0)} r={gripR} color={palette.ink} />
-        <Circle cx={card.width + 2} cy={card.height + 2 + (isSpace ? 8 : 0)} r={pipR} color={palette.paper} />
-      </>}
+      {handles && <CardHandles width={card.width} height={card.height} isSpace={isSpace} view={view} palette={palette} />}
       {isSpace && <SkiaText x={18} y={card.height - 13}
         text={count ? `${count} ${count === 1 ? 'card' : 'cards'}` : 'Empty'} font={fonts.footer} color={cardInk.muted} />}
     </Group>
   );
-});
+  // Every answer from the server is made of new objects. A card is drawn again only if what it holds has changed.
+}, (before, after) => before.selected === after.selected && before.grouped === after.grouped && before.handles === after.handles
+  && before.editing === after.editing && before.playing === after.playing && before.drag === after.drag && before.positions === after.positions
+  && before.group === after.group && before.view === after.view && before.fonts === after.fonts && before.palette === after.palette
+  && sameData(before.card, after.card));
+
+/**
+ * The connect dot and resize grip of the selected card. They follow the zoom on every frame,
+ * so they are a component of their own: only the one card showing them pays for that.
+ */
+function CardHandles({ width, height, isSpace, view, palette }: { width: number; height: number; isSpace: boolean; view: SharedValue<Viewport>; palette: Palette }) {
+  // Handles keep the same size on screen however far the canvas is zoomed.
+  const dotX = useDerivedValue(() => width + DOT_GAP / view.get().scale, [width]);
+  const dotR = useDerivedValue(() => 10 / view.get().scale);
+  const gripR = useDerivedValue(() => 9 / view.get().scale);
+  const pipR = useDerivedValue(() => 3.5 / view.get().scale);
+  const hair = useDerivedValue(() => 2 / view.get().scale);
+  return <>
+    {/* Drag the dot to another card to connect them. */}
+    <Circle cx={dotX} cy={height / 2} r={dotR} color={palette.paper} />
+    <Circle cx={dotX} cy={height / 2} r={dotR} color={palette.ink} style="stroke" strokeWidth={hair} />
+    <Circle cx={dotX} cy={height / 2} r={pipR} color={palette.ink} />
+    {/* Drag the corner to resize. */}
+    <Circle cx={width + 2} cy={height + 2 + (isSpace ? 8 : 0)} r={gripR} color={palette.ink} />
+    <Circle cx={width + 2} cy={height + 2 + (isSpace ? 8 : 0)} r={pipR} color={palette.paper} />
+  </>;
+}
 
 /**
  * A connector between two cards. Its path is worked out on the UI thread from the cards'
  * live positions, so it stays attached while either card is being dragged.
  */
-const ConnectorNode = memo(function ConnectorNode({ from, to, color, selected, bend, drag, positions, group, palette }: {
-  from: CanvasCard; to: CanvasCard; color: string; palette: Palette; selected: boolean; bend: number;
+const ConnectorNode = memo(function ConnectorNode({ fromId, fromX, fromY, fromWidth, fromHeight, toId, toX, toY, toWidth, toHeight, color, selected, bend, drag, positions, group, palette }: {
+  /** Each end is given as its id and box alone, so a card's text changing does not redraw its connectors. */
+  fromId: string; fromX: number; fromY: number; fromWidth: number; fromHeight: number;
+  toId: string; toX: number; toY: number; toWidth: number; toHeight: number;
+  color: string; palette: Palette; selected: boolean; bend: number;
   group: SharedValue<string[]>;
   drag: SharedValue<DragState>;
   positions: SharedValue<Record<string, Point>>;
 }) {
   const path = useDerivedValue(() => {
     const held = drag.get(), placed = positions.get(), members = group.get();
-    const at = (card: CanvasCard) => {
-      if (held.id === card._id) return held;
-      const spot = placed[card._id] ?? card;
-      const rides = held.id !== null && members.length > 1 && members.includes(card._id) && members.includes(held.id);
+    const at = (id: string, x: number, y: number) => {
+      if (held.id === id) return { x: held.x, y: held.y };
+      const spot = placed[id] ?? { x, y };
+      const rides = held.id !== null && members.length > 1 && members.includes(id) && members.includes(held.id);
       return rides ? { x: spot.x + held.x - held.ox, y: spot.y + held.y - held.oy } : spot;
     };
-    const a = at(from), b = at(to);
-    const curve = connectorCurve({ x: a.x, y: a.y, width: from.width, height: from.height }, { x: b.x, y: b.y, width: to.width, height: to.height }, bend);
+    const a = at(fromId, fromX, fromY), b = at(toId, toX, toY);
+    const curve = connectorCurve({ x: a.x, y: a.y, width: fromWidth, height: fromHeight }, { x: b.x, y: b.y, width: toWidth, height: toHeight }, bend);
     const builder = Skia.PathBuilder.Make();
     if (!curve) return builder.build();
     const angle = Math.atan2(curve.ey - curve.cy, curve.ex - curve.cx);
     return builder.moveTo(curve.sx, curve.sy).quadTo(curve.cx, curve.cy, curve.ex, curve.ey)
       .moveTo(curve.ex - Math.cos(angle + 0.45) * 13, curve.ey - Math.sin(angle + 0.45) * 13).lineTo(curve.ex, curve.ey)
       .lineTo(curve.ex - Math.cos(angle - 0.45) * 13, curve.ey - Math.sin(angle - 0.45) * 13).build();
-  }, [bend, from._id, from.x, from.y, from.width, from.height, to._id, to.x, to.y, to.width, to.height]);
+  }, [bend, fromId, fromX, fromY, fromWidth, fromHeight, toId, toX, toY, toWidth, toHeight]);
   return <>
     {selected && <Path path={path} color={palette.line} style="stroke" strokeWidth={12} strokeCap="round" strokeJoin="round" />}
     <Path path={path} color={selected ? palette.ink : color} style="stroke" strokeWidth={selected ? 3.5 : 2.5} strokeCap="round" strokeJoin="round" />
@@ -281,7 +314,7 @@ const StrokeNode = memo(function StrokeNode({ stroke, erasing, palette }: {
   // Ink drawn in the black pen follows the chrome's ink, so it still shows on a dark canvas.
   return <Path path={path} color={spaceAccent(stroke.color, palette)} strokeWidth={stroke.width}
     style="stroke" strokeCap="round" strokeJoin="round" opacity={opacity} />;
-});
+}, (before, after) => before.erasing === after.erasing && before.palette === after.palette && sameData(before.stroke, after.stroke));
 
 type ZoomSource = { key: number; canvasId: string; left: number; top: number; width: number; height: number };
 
@@ -295,12 +328,57 @@ function ZoomSourceView({ source, pressRef, onPress }: { source: ZoomSource; pre
     style={{ position: 'absolute', left: source.left, top: source.top, width: source.width, height: source.height, borderRadius: 9 }} />;
 }
 
-/** A native drawing surface. Controls and accessible board navigation live in the parent screen. */
-export function CanvasSurface({
+/** The canvas as a PNG, or null if it could not be drawn or is no longer wanted. */
+async function snapshotPng(canvas: ReturnType<typeof useCanvasRef>, wanted: () => boolean) {
+  try {
+    const image = await canvas.current?.makeImageSnapshotAsync();
+    if (!wanted() || !image) return null;
+    return image.encodeToBase64(ImageFormat.PNG, 100);
+  } catch { return null; }
+}
+
+/** Everything the surface reports back to its parent. */
+const HANDLERS = [
+  'onCapture', 'onSelect', 'onDragSelect', 'onOpen', 'onMove', 'onStroke', 'onErase', 'onViewportChange', 'onCanvasPoint', 'onInteraction', 'onPinchOut',
+  'onWillOpen', 'onToggleItem', 'onSelectConnector', 'onConnect', 'onResize', 'onCardMenu', 'onAddAt', 'onGroupSelect', 'onPlay', 'onLostContent',
+] as const;
+type HandlerName = (typeof HANDLERS)[number];
+type AnyHandler = (...args: unknown[]) => void;
+
+/**
+ * A native drawing surface. Controls and accessible board navigation live in the parent screen.
+ *
+ * The parent re-renders for many reasons that do not concern the canvas, and passes new
+ * functions each time. This shell hands the drawing below one unchanging function per
+ * callback, each of which calls whatever the parent passed most recently, so the drawing
+ * is only rendered again when what it shows has changed.
+ */
+export function CanvasSurface(props: CanvasSurfaceProps) {
+  const latest = useRef(props);
+  useLayoutEffect(() => { latest.current = props; });
+  const [steady] = useState(() => ({
+    handlers: Object.fromEntries(HANDLERS.map(name => [name, (...args: unknown[]) => (latest.current[name] as AnyHandler | undefined)?.(...args)])) as Record<HandlerName, AnyHandler>,
+    onTitleChange: (value: string) => latest.current.editing?.onTitleChange(value),
+    onBodyChange: (value: string) => latest.current.editing?.onBodyChange(value),
+  }));
+  // A callback the parent leaves out stays left out: some of them switch a behaviour on by being there.
+  const handlers = Object.fromEntries(HANDLERS.filter(name => props[name]).map(name => [name, steady.handlers[name]])) as Pick<CanvasSurfaceProps, HandlerName>;
+  const editingId = props.editing?.id, editingTitle = props.editing?.title, editingBody = props.editing?.body, selectAll = props.editing?.selectAll;
+  const editing = useMemo(() => editingId === undefined ? undefined : {
+    id: editingId, title: editingTitle ?? '', body: editingBody ?? '', selectAll, onTitleChange: steady.onTitleChange, onBodyChange: steady.onBodyChange,
+  }, [editingId, editingTitle, editingBody, selectAll, steady]);
+  return <CanvasDrawing {...props} {...handlers} editing={editing} />;
+}
+
+const CanvasDrawing = memo(function CanvasDrawing({
   cards, strokes, connectors = NO_CONNECTORS, connecting = false, mode, selectedId, color, strokeWidth, initialViewport, preferReadableStart = false, cameraAction, captureRequest = 0, onCapture,
   onSelect, onDragSelect, onOpen, onMove, onStroke, onErase, onViewportChange, onCanvasPoint, onInteraction, onPinchOut, onWillOpen, onToggleItem, selectedConnectorId, onSelectConnector,
   groupIds = NO_IDS, editing, playingId, onConnect, onResize, onCardMenu, onAddAt, onGroupSelect, onPlay, onLostContent,
 }: CanvasSurfaceProps) {
+  // The React Compiler lifts small inline functions out of this component, including ones inside
+  // gesture worklets, and a lifted function is not a worklet: calling it on the UI thread crashes.
+  // This component memoises by hand instead.
+  'use no memo';
   const canvasRef = useCanvasRef();
   const { palette } = useTheme();
   const [size, setSize] = useState<Size>({ width: 0, height: 0 });
@@ -312,10 +390,10 @@ export function CanvasSurface({
   const consumedCapture = useRef(0);
   const captureCallback = useRef(onCapture);
   useEffect(() => { captureCallback.current = onCapture; }, [onCapture]);
-  const fonts = useMemo(() => makeFonts(), []);
+  const fonts = canvasFonts();
   const viewport = useSharedValue<Viewport>(initialViewport ?? { x: 36, y: 48, scale: 1 });
   const sceneSize = useSharedValue<Size>({ width: 0, height: 0 });
-  const sceneCards = useSharedValue<CanvasCard[]>([]);
+  const sceneCards = useSharedValue<SceneCard[]>([]);
   const positions = useSharedValue<Record<string, Point>>({});
   const strokeTargets = useSharedValue<StrokeTarget[]>([]);
   const drag = useSharedValue<DragState>(IDLE);
@@ -365,7 +443,7 @@ export function CanvasSurface({
     ? { ...card, ...pendingPositions[card._id] } : card), [cards, pendingPositions]);
 
   useEffect(() => {
-    sceneCards.set(displayCards);
+    sceneCards.set(displayCards.map(({ _id, kind, x, y, width, height }) => ({ _id, kind, x, y, width, height })));
     positions.set(Object.fromEntries(displayCards.map((card) => [card._id, { x: card.x, y: card.y }])));
     const current = drag.get();
     const committed = displayCards.find((card) => card._id === current.id);
@@ -376,12 +454,16 @@ export function CanvasSurface({
     if (ghost.get().active && action.get() !== 6) ghost.set({ ...ghost.get(), active: false });
   }, [displayCards, sceneCards, positions, action, drag, ghost, groupIds]);
 
+  const erasable = mode === 'erase';
   useEffect(() => {
+    // Only the eraser looks at these, so every line's points are sent across to it only while it is the tool in hand.
+    if (!erasable) { strokeTargets.set([]); return; }
     // A fresh line is visible immediately, but cannot be erased until it has a server id.
-    strokeTargets.set(displayStrokes.filter((stroke) => !stroke._id.startsWith('pending-')).map((stroke) => ({
-      id: stroke._id, width: stroke.width, points: pathToPoints(stroke.path),
-    })));
-  }, [displayStrokes, strokeTargets]);
+    strokeTargets.set(displayStrokes.filter((stroke) => !stroke._id.startsWith('pending-')).map((stroke) => {
+      const { points, bounds } = strokeGeometry(stroke._id, stroke.path);
+      return { id: stroke._id, width: stroke.width, points, bounds };
+    }));
+  }, [displayStrokes, erasable, strokeTargets]);
 
   // Optimistic state is dropped as soon as the server copy catches up. This is
   // derived from props, so it is adjusted while rendering rather than in an effect.
@@ -425,7 +507,7 @@ export function CanvasSurface({
 
   const bounds = useMemo(() => unionBounds([
     ...displayCards.map(({ x, y, width, height }) => ({ x, y, width, height })),
-    ...displayStrokes.map((stroke) => boundsOfPoints(pathToPoints(stroke.path)))
+    ...displayStrokes.map((stroke) => strokeGeometry(stroke._id, stroke.path).bounds)
       .filter((bound): bound is NonNullable<typeof bound> => Boolean(bound)),
   ]), [displayCards, displayStrokes]);
 
@@ -573,10 +655,8 @@ export function CanvasSurface({
     let active = true;
     void (async () => {
       await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-      try {
-        const image = await canvasRef.current?.makeImageSnapshotAsync();
-        if (active) { consumedCapture.current = captureRequest; captureCallback.current?.(image?.encodeToBase64(ImageFormat.PNG, 100) ?? null, captureRequest); }
-      } catch { if (active) { consumedCapture.current = captureRequest; captureCallback.current?.(null, captureRequest); } }
+      const png = await snapshotPng(canvasRef, () => active);
+      if (active) { consumedCapture.current = captureRequest; captureCallback.current?.(png, captureRequest); }
     })();
     return () => { active = false; };
   }, [captureRequest, size.width, size.height, canvasRef]);
@@ -651,14 +731,19 @@ export function CanvasSurface({
           let guideV = Number.NaN, guideH = Number.NaN, bestX = near, bestY = near;
           for (const other of all) {
             if (other._id === card._id || (members.includes(card._id) && members.includes(other._id))) continue;
-            for (const theirs of [other.x, other.x + other.width / 2, other.x + other.width]) {
-              for (const mine of [0, card.width / 2, card.width]) {
+            // Left edge, centre, right edge of the other card against the same three of this one; then top, middle, bottom.
+            for (let theirEdge = 0; theirEdge < 3; theirEdge += 1) {
+              const theirs = other.x + other.width * theirEdge / 2;
+              for (let myEdge = 0; myEdge < 3; myEdge += 1) {
+                const mine = card.width * myEdge / 2;
                 const gap = Math.abs(x + mine - theirs);
                 if (gap < bestX) { bestX = gap; guideV = theirs; x = theirs - mine; }
               }
             }
-            for (const theirs of [other.y, other.y + other.height / 2, other.y + other.height]) {
-              for (const mine of [0, card.height / 2, card.height]) {
+            for (let theirEdge = 0; theirEdge < 3; theirEdge += 1) {
+              const theirs = other.y + other.height * theirEdge / 2;
+              for (let myEdge = 0; myEdge < 3; myEdge += 1) {
+                const mine = card.height * myEdge / 2;
                 const gap = Math.abs(y + mine - theirs);
                 if (gap < bestY) { bestY = gap; guideH = theirs; y = theirs - mine; }
               }
@@ -689,8 +774,9 @@ export function CanvasSurface({
       } else if (currentAction === 4) {
         const point = screenToWorld({ x: event.x, y: event.y }, viewport.get());
         const current = erasing.get();
+        const reach = 12 / viewport.get().scale;
         const hits = strokeTargets.get().filter((stroke) =>
-          !current.includes(stroke.id) && hitStroke(stroke.points, point, 12 / viewport.get().scale + stroke.width / 2));
+          nearBounds(stroke.bounds, point, reach + stroke.width / 2) && !current.includes(stroke.id) && hitStroke(stroke.points, point, reach + stroke.width / 2));
         if (hits.length) erasing.set([...current, ...hits.map((stroke) => stroke.id)]);
       }
     },
@@ -707,7 +793,7 @@ export function CanvasSurface({
             const placed = { x: current.x, y: current.y };
             const dx = current.x - current.ox, dy = current.y - current.oy, members = group.get();
             const together = members.length > 1 && members.includes(id);
-            const spot = (card: CanvasCard) => card._id === id ? placed : together && members.includes(card._id) ? { x: card.x + dx, y: card.y + dy } : null;
+            const spot = (card: SceneCard) => card._id === id ? placed : together && members.includes(card._id) ? { x: card.x + dx, y: card.y + dy } : null;
             sceneCards.set(sceneCards.get().map((card) => { const next = spot(card); return next ? { ...card, ...next } : card; }));
             positions.modify((value) => { for (const card of sceneCards.get()) if (card._id === id || (together && members.includes(card._id))) value[card._id] = { x: card.x, y: card.y }; return value; });
             scheduleOnRN(commitMove, id, placed.x, placed.y, dx, dy);
@@ -880,8 +966,9 @@ export function CanvasSurface({
       if (mode === 'draw') {
         scheduleOnRN(commitStroke, { path: serializeStroke([point]), color, width: strokeWidth });
       } else if (mode === 'erase') {
+        const reach = 12 / viewport.get().scale;
         const hits = strokeTargets.get().filter((stroke) =>
-          hitStroke(stroke.points, point, 12 / viewport.get().scale + stroke.width / 2));
+          nearBounds(stroke.bounds, point, reach + stroke.width / 2) && hitStroke(stroke.points, point, reach + stroke.width / 2));
         scheduleOnRN(commitErase, hits.map((stroke) => stroke.id));
       } else scheduleOnRN(tapAt, hitCard(sceneCards.get(), point), point);
     },
@@ -893,17 +980,26 @@ export function CanvasSurface({
     const current = viewport.get();
     return [{ translateX: current.x }, { translateY: current.y }, { scale: current.scale }];
   });
-  const gridPath = useDerivedValue(() => {
-    const current = viewport.get();
+  // The dots are laid out once for a given spacing and surface size, starting at the corner
+  // with a spare row and column, and then slid into place. Moving the canvas only changes
+  // the slide; the dots are laid out again when zooming changes how far apart they sit.
+  const gridPath = useSharedValue(Skia.Path.Make());
+  useAnimatedReaction(() => {
     const measured = sceneSize.get();
-    const spacing = Math.max(20, 40 * current.scale);
-    const offsetX = ((current.x % spacing) + spacing) % spacing;
-    const offsetY = ((current.y % spacing) + spacing) % spacing;
+    return { spacing: Math.max(20, 40 * viewport.get().scale), width: measured.width, height: measured.height };
+  }, (grid, previous) => {
+    if (previous && previous.spacing === grid.spacing && previous.width === grid.width && previous.height === grid.height) return;
     const path = Skia.PathBuilder.Make();
-    for (let x = offsetX; x < measured.width; x += spacing) {
-      for (let y = offsetY; y < measured.height; y += spacing) path.moveTo(x, y).lineTo(x + 0.1, y);
+    for (let x = 0; x < grid.width + grid.spacing; x += grid.spacing) {
+      for (let y = 0; y < grid.height + grid.spacing; y += grid.spacing) path.moveTo(x, y).lineTo(x + 0.1, y);
     }
-    return path.build();
+    gridPath.set(path.build());
+  });
+  const gridTransform = useDerivedValue(() => {
+    const current = viewport.get();
+    const spacing = Math.max(20, 40 * current.scale);
+    // One step back, so the spare row and column cover the edge the dots slide in from.
+    return [{ translateX: ((current.x % spacing) + spacing) % spacing - spacing }, { translateY: ((current.y % spacing) + spacing) % spacing - spacing }];
   });
 
   const wirePath = useDerivedValue(() => {
@@ -934,15 +1030,18 @@ export function CanvasSurface({
     return { transform: [{ translateX: view.x + spot.x * view.scale }, { translateY: view.y + spot.y * view.scale }, { scale: view.scale }] };
   });
   const editingWidth = editingCard?.width ?? 0;
+  // Where the card being typed on sits now. Kept to one side so the camera below moves
+  // only when editing starts; the card may be moved afterwards without the camera chasing it.
+  const editingBox = useRef({ x: editingX, y: editingY, width: editingWidth });
+  useEffect(() => { editingBox.current = { x: editingX, y: editingY, width: editingWidth }; }, [editingX, editingY, editingWidth]);
   useEffect(() => {
     if (!editingId || !size.width) return;
+    const box = editingBox.current;
     // Bring the card to the top of the screen, at a readable size, clear of the keyboard.
-    const scale = Math.min(1.4, Math.max(viewport.get().scale, Math.min(1, (size.width - 48) / editingWidth)));
-    const next = { scale, x: (size.width - editingWidth * scale) / 2 - editingX * scale, y: 110 - editingY * scale };
+    const scale = Math.min(1.4, Math.max(viewport.get().scale, Math.min(1, (size.width - 48) / box.width)));
+    const next = { scale, x: (size.width - box.width * scale) / 2 - box.x * scale, y: 110 - box.y * scale };
     viewport.set(withTiming(next, GLIDE));
-    // Only when editing starts; the card may be moved afterwards without the camera chasing it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editingId, size.width]);
+  }, [editingId, size.width, viewport]);
 
   return (
     <GestureDetector gesture={gestures}>
@@ -952,11 +1051,14 @@ export function CanvasSurface({
         testID="canvas-surface">
         <Canvas ref={canvasRef} style={{ flex: 1 }} opaque>
           <Fill color={palette.canvas} />
-          <Path path={gridPath} style="stroke" strokeWidth={1.5} strokeCap="round" color={palette.canvasDot} />
+          <Group transform={gridTransform}>
+            <Path path={gridPath} style="stroke" strokeWidth={1.5} strokeCap="round" color={palette.canvasDot} />
+          </Group>
           <Group transform={worldTransform}>
             {connectors.map((connector) => {
               const from = displayCards.find(card => card._id === connector.fromCardId), to = displayCards.find(card => card._id === connector.toCardId);
-              return from && to ? <ConnectorNode key={connector._id} from={from} to={to} bend={bends[connector._id] ?? 0.14} color={spaceAccent(connector.color ?? palette.muted, palette)} palette={palette} selected={connector._id === selectedConnectorId} drag={drag} positions={positions} group={group} /> : null;
+              return from && to ? <ConnectorNode key={connector._id} fromId={from._id} fromX={from.x} fromY={from.y} fromWidth={from.width} fromHeight={from.height}
+                toId={to._id} toX={to.x} toY={to.y} toWidth={to.width} toHeight={to.height} bend={bends[connector._id] ?? 0.14} color={spaceAccent(connector.color ?? palette.muted, palette)} palette={palette} selected={connector._id === selectedConnectorId} drag={drag} positions={positions} group={group} /> : null;
             })}
             {displayCards.map((card) => <CardNode key={card._id} card={card} selected={card._id === selectedId} grouped={groupIds.includes(card._id)}
               handles={card._id === selectedId && mode === 'select' && !connecting && !editing && groupIds.length === 0} editing={editing?.id === card._id} playing={playingId === card._id}
@@ -987,6 +1089,6 @@ export function CanvasSurface({
       </View>
     </GestureDetector>
   );
-}
+});
 
 export default CanvasSurface;

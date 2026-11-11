@@ -1,7 +1,8 @@
 import { v } from 'convex/values';
-import { mutation, query } from './_generated/server';
+import { internal } from './_generated/api';
+import { internalMutation, mutation, query } from './_generated/server';
 import type { MutationCtx } from './_generated/server';
-import { colorValue, ensureUser, fail, MAX_WORKSPACES, requireIdentity, requireOwner, textValue } from './model/auth';
+import { colorValue, ensureUser, fail, MAX_MEMBERS, MAX_WORKSPACES, requireIdentity, requireOwner, textValue } from './model/auth';
 import { insertCard } from './model/canvas';
 import { workspaceSummary } from './validators';
 import { spaceTemplates, type SpaceTemplateId, type TemplateCard } from '../shared/space-templates';
@@ -16,7 +17,7 @@ async function insertWorkspace(ctx: MutationCtx, title: string, color: string, i
   if (existing.length >= MAX_WORKSPACES) fail('LIMIT_REACHED', 'You have reached the workspace limit.');
   const now = Date.now();
   const _id = await ctx.db.insert('workspaces', {
-    ownerId: identity.subject, title, color, isDemo, deleted: false, createdAt: now, updatedAt: now,
+    ownerId: identity.subject, title, color, isDemo, memberCount: 0, deleted: false, createdAt: now, updatedAt: now,
   });
   const rootCanvasId = await ctx.db.insert('canvases', {
     workspaceId: _id, title, parentCanvasId: null, parentCardId: null,
@@ -44,8 +45,10 @@ export const list = query({
     const summaries = await Promise.all(all.map(async ({ row, role }) => {
       if (!row.rootCanvasId) fail('NOT_FOUND', 'Workspace is unavailable.');
       const root = await ctx.db.get(row.rootCanvasId);
-      const shared = role === 'member' || !!row.shareCode ||
-        !!(await ctx.db.query('members').withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', row._id)).first());
+      // The space's own tally answers this. Only a space from before the tally existed is looked up in `members`.
+      const shared = role === 'member' || !!row.shareCode || (row.memberCount === undefined
+        ? !!(await ctx.db.query('members').withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', row._id)).first())
+        : row.memberCount > 0);
       return {
         _id: row._id, title: row.title, color: row.color, rootCanvasId: row.rootCanvasId, updatedAt: row.updatedAt, createdAt: row.createdAt,
         cardCount: root?.cardCount ?? 0, isDemo: role === 'owner' && row.isDemo, pinned: role === 'owner' && (row.pinned ?? false),
@@ -53,6 +56,27 @@ export const list = query({
       };
     }));
     return summaries.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt);
+  },
+});
+
+/**
+ * Gives spaces made before `memberCount` existed their tally, a batch at a time. Nothing
+ * depends on it having run: a space without the tally is still answered from `members`.
+ * Run once from the dashboard or `npx convex run workspaces:backfillMemberCounts` to
+ * spare those spaces that lookup.
+ */
+export const backfillMemberCounts = internalMutation({
+  args: { cursor: v.optional(v.union(v.string(), v.null())) },
+  returns: v.null(),
+  handler: async (ctx, { cursor }) => {
+    const batch = await ctx.db.query('workspaces').paginate({ numItems: 50, cursor: cursor ?? null });
+    for (const workspace of batch.page) {
+      if (workspace.memberCount !== undefined) continue;
+      const members = await ctx.db.query('members').withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', workspace._id)).take(MAX_MEMBERS);
+      await ctx.db.patch(workspace._id, { memberCount: members.length });
+    }
+    if (!batch.isDone) await ctx.scheduler.runAfter(0, internal.workspaces.backfillMemberCounts, { cursor: batch.continueCursor });
+    return null;
   },
 });
 

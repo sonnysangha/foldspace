@@ -1,10 +1,10 @@
-import { useMutation, useQuery } from 'convex/react';
+import { useConvex, useMutation, useQuery } from 'convex/react';
 import type { FunctionReturnType } from 'convex/server';
 import * as Haptics from 'expo-haptics';
 import { Link, router, useFocusEffect } from 'expo-router';
 import { Stack } from 'expo-router/stack';
 import { SymbolView } from 'expo-symbols';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { ActionSheetIOS, ActivityIndicator, FlatList, Pressable, ScrollView, Text, View, useWindowDimensions } from 'react-native';
 
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -21,6 +21,7 @@ import { TemplatePreview } from '@/screens/space-form-screen';
 import { radius, spaceAccent, spaceColors, spacing, useTheme, type Palette } from '@/theme';
 import { errorMessage } from '@/utils/error-message';
 import { relativeTime } from '@/utils/relative-time';
+import { keepOrder, sameData } from '@/utils/stable';
 
 type Space = FunctionReturnType<typeof api.workspaces.list>[number];
 type Found = FunctionReturnType<typeof api.search.everywhere>[number];
@@ -37,16 +38,24 @@ function wash(hex: string, paper: string, amount: number) {
   return `#${[1, 3, 5].map(at => Math.round(channel(paper, at) + (channel(hex, at) - channel(paper, at)) * amount).toString(16).padStart(2, '0')).join('')}`;
 }
 
+/** Ends warm-up subscriptions. If the space was deleted meanwhile the client has already dropped the query, and letting go again throws. */
+function letGo(...releases: (() => void)[]) {
+  for (const release of releases) {
+    try { release(); } catch { /* already gone */ }
+  }
+}
+
 const cardsLabel = (count: number) => count === 0 ? 'Empty' : `${count} ${count === 1 ? 'card' : 'cards'}`;
 const sectionLabelFor = (palette: Palette) => ({ fontSize: 13, fontWeight: '600', color: palette.muted }) as const;
 
-function SpaceCover({ canvasId, color, aspect }: { canvasId: Id<'canvases'>; color: string; aspect: number }) {
+function SpaceCover({ canvasId, color, aspect, width }: { canvasId: Id<'canvases'>; color: string; aspect: number; width: number }) {
   const preview = useQuery(api.canvases.preview, { canvasId });
   const { dark, palette } = useTheme();
   // On dark paper a little more of the colour is needed for the tile to read as tinted.
   const background = wash(spaceAccent(color, palette), palette.paper, dark ? 0.12 : 0.07);
   return <View style={{ aspectRatio: aspect, backgroundColor: background, borderRadius: radius.lg, borderCurve: 'continuous', overflow: 'hidden', borderWidth: 1, borderColor: palette.line }}>
-    {preview ? <CanvasPreviewCover preview={preview} background={background} padding={14} /> : null}
+    {/* The cover's size is known from the tile, less its border, so its first frame already draws. */}
+    {preview ? <CanvasPreviewCover preview={preview} background={background} padding={14} width={width - 2} height={width / aspect - 2} /> : null}
   </View>;
 }
 
@@ -54,10 +63,14 @@ function SpaceCover({ canvasId, color, aspect }: { canvasId: Id<'canvases'>; col
  * One space: its cover, name, and what is inside. A tap zooms into it; holding it offers its
  * actions, so the tile needs no button of its own.
  */
-function SpaceTile({ space, width, aspect, now, onPin, onDelete, onLeave }: {
+type SpaceTileProps = {
   space: Space; width: number; aspect: number; now: number;
+  /** A finger has landed on the tile, so its canvas is probably about to be opened. */
+  onTouch: (space: Space) => void;
   onPin: (space: Space) => void; onDelete: (space: Space) => void; onLeave: (space: Space) => void;
-}) {
+};
+
+const SpaceTile = memo(function SpaceTile({ space, width, aspect, now, onTouch, onPin, onDelete, onLeave }: SpaceTileProps) {
   const { palette, type } = useTheme();
   const edit = () => router.push({ pathname: '/edit-workspace/[id]', params: { id: space._id } });
   const search = () => router.push({ pathname: '/search/[id]', params: { id: space._id } });
@@ -92,8 +105,8 @@ function SpaceTile({ space, width, aspect, now, onPin, onDelete, onLeave }: {
     */}
     <Link href={{ pathname: '/workspace/[id]', params: { id: space._id } }} asChild>
       <Link.AppleZoom>
-        <Pressable accessible={false} accessibilityElementsHidden importantForAccessibility="no-hide-descendants" onLongPress={sheet} style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
-          <SpaceCover canvasId={space.rootCanvasId} color={space.color} aspect={aspect} />
+        <Pressable accessible={false} accessibilityElementsHidden importantForAccessibility="no-hide-descendants" onPressIn={() => onTouch(space)} onLongPress={sheet} style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
+          <SpaceCover canvasId={space.rootCanvasId} color={space.color} aspect={aspect} width={width} />
         </Pressable>
       </Link.AppleZoom>
     </Link>
@@ -101,7 +114,7 @@ function SpaceTile({ space, width, aspect, now, onPin, onDelete, onLeave }: {
       accessibilityValue={{ text: `${detail}${space.role === 'owner' && space.shared ? ', shared' : ''}, edited ${relativeTime(space.updatedAt, now)}` }}
       accessibilityActions={actions.map(({ name, label }) => ({ name, label }))}
       onAccessibilityAction={({ nativeEvent }) => actions.find(action => action.name === nativeEvent.actionName)?.run()}
-      onPress={() => router.push({ pathname: '/workspace/[id]', params: { id: space._id } })} onLongPress={sheet}
+      onPressIn={() => onTouch(space)} onPress={() => router.push({ pathname: '/workspace/[id]', params: { id: space._id } })} onLongPress={sheet}
       style={({ pressed }) => ({ gap: 2, paddingHorizontal: 2, opacity: pressed ? 0.6 : 1 })}>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.xs }}>
         <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 16, fontWeight: '600', letterSpacing: -0.2, color: palette.ink }}>{space.title}</Text>
@@ -110,7 +123,9 @@ function SpaceTile({ space, width, aspect, now, onPin, onDelete, onLeave }: {
       <Text numberOfLines={1} style={type.caption}>{detail} · {relativeTime(space.updatedAt, now)}</Text>
     </Pressable>
   </View>;
-}
+  // Each list result arrives as new objects, so a space is compared by what it holds.
+}, (before, after) => before.width === after.width && before.aspect === after.aspect && before.now === after.now
+  && before.onTouch === after.onTouch && before.onPin === after.onPin && before.onDelete === after.onDelete && before.onLeave === after.onLeave && sameData(before.space, after.space));
 
 function ResultRow({ icon, dot, title, detail, label, onPress }: {
   icon?: (typeof kindIcons)[string]; dot?: string; title: string; detail?: string; label: string; onPress: () => void;
@@ -186,7 +201,16 @@ export function LibraryScreen() {
   const [listWidth, setListWidth] = useState(0);
   // "2h ago" is measured from when the library was last looked at, not from each render.
   const [now, setNow] = useState(() => Date.now());
-  useFocusEffect(useCallback(() => { setNow(Date.now()); }, []));
+  // While a space is open its edits would move it to the front of the grid underneath, and
+  // the cover the zoom returns to would be rebuilt somewhere else. The order is held from
+  // the moment the library is left until the way back has finished.
+  const [heldOrder, setHeldOrder] = useState<string[] | null>(null);
+  const shownOrder = useRef<string[]>([]);
+  useFocusEffect(useCallback(() => {
+    setNow(Date.now());
+    const timer = setTimeout(() => setHeldOrder(null), 600);
+    return () => { clearTimeout(timer); setHeldOrder(shownOrder.current); };
+  }, []));
   const notice = useNotice();
   const window = useWindowDimensions();
   // In landscape the tab bar and toolbar stand down one side; the grid stops short of them.
@@ -196,7 +220,10 @@ export function LibraryScreen() {
   const gap = spacing.lg;
   const tileWidth = Math.floor((width - gap * (columns - 1)) / columns);
   const text = query.trim();
-  const sorted = [...spaces ?? []].sort(SORTS[sort].compare);
+  const ordered = [...spaces ?? []].sort(SORTS[sort].compare);
+  const sorted = heldOrder ? keepOrder(ordered, heldOrder) : ordered;
+  const sortedIds = sorted.map(space => space._id).join(' ');
+  useEffect(() => { shownOrder.current = sortedIds ? sortedIds.split(' ') : []; }, [sortedIds]);
   const pinned = sorted.filter(space => space.pinned);
   const rest = sorted.filter(space => !space.pinned);
   const hasExample = spaces?.some(space => space.isDemo) ?? true;
@@ -210,7 +237,7 @@ export function LibraryScreen() {
     setBusy(what);
     try { await work(); }
     catch (error) { notice(errorMessage(error, failed)); }
-    finally { lock.current = false; setBusy(null); }
+    lock.current = false; setBusy(null);
   };
   const openExample = () => run('example', async () => {
     router.push({ pathname: '/workspace/[id]', params: { id: (await seed({}))._id } });
@@ -230,27 +257,35 @@ export function LibraryScreen() {
       router.push({ pathname: '/canvas/[id]', params: { id: card.canvasId, card: card._id, edit: window.width < 560 ? 'inline' : '1' } });
     }, 'Could not add a note. Try again.');
   };
-  const togglePin = ({ _id: id, pinned: wasPinned }: Space) => {
+  // Start loading a space's canvas as the finger lands on its tile, so it is already there
+  // when the screen opens a moment later. The screen then holds it; this lets go after a while.
+  const convex = useConvex();
+  const warmCanvas = useCallback(({ rootCanvasId: canvasId }: Space) => {
+    const releaseCards = convex.watchQuery(api.canvases.cards, { canvasId }).onUpdate(() => {});
+    const releaseInk = convex.watchQuery(api.canvases.strokes, { canvasId }).onUpdate(() => {});
+    setTimeout(() => letGo(releaseCards, releaseInk), 8000);
+  }, [convex]);
+  const togglePin = useCallback(({ _id: id, pinned: wasPinned }: Space) => {
     void setPinned({ id, pinned: !wasPinned })
       .then(() => notice(wasPinned ? 'Unpinned' : 'Pinned to the top'))
       .catch(error => notice(errorMessage(error, 'Could not update this pin. Try again.')));
-  };
+  }, [notice, setPinned]);
   // No "are you sure": the space goes at once, and the message that says so can bring it back.
-  const deleteSpace = ({ _id: id, title }: Space) => {
+  const deleteSpace = useCallback(({ _id: id, title }: Space) => {
     void remove({ id })
       .then(() => notice(`Deleted “${title}”`, {
         label: 'Undo',
         onPress: () => { void restore({ id }).catch(error => notice(errorMessage(error, 'Could not bring this space back.'))); },
       }))
       .catch(error => notice(errorMessage(error, 'Could not delete this space. Try again.')));
-  };
-  const leaveSpace = ({ _id: workspaceId, title }: Space) => {
+  }, [notice, remove, restore]);
+  const leaveSpace = useCallback(({ _id: workspaceId, title }: Space) => {
     void leave({ workspaceId })
       .then(() => notice(`Left “${title}”`))
       .catch(error => notice(errorMessage(error, 'Could not leave this space. Try again.')));
-  };
+  }, [leave, notice]);
   const tile = (space: Space, tileSize: number, aspect: number) =>
-    <SpaceTile key={space._id} space={space} width={tileSize} aspect={aspect} now={now} onPin={togglePin} onDelete={deleteSpace} onLeave={leaveSpace} />;
+    <SpaceTile key={space._id} space={space} width={tileSize} aspect={aspect} now={now} onTouch={warmCanvas} onPin={togglePin} onDelete={deleteSpace} onLeave={leaveSpace} />;
 
   const header = <View style={{ gap: spacing.xl }}>
     {!!pinned.length && <View style={{ gap: spacing.md }}>

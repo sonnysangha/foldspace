@@ -1,5 +1,6 @@
 import { v } from 'convex/values';
-import { mutation, query } from './_generated/server';
+import type { Id } from './_generated/dataModel';
+import { mutation, query, type MutationCtx } from './_generated/server';
 import { fail, MAX_MEMBERS, requireIdentity, requireOwner, requireWorkspace, textValue } from './model/auth';
 
 // No 0/O or 1/I/L, so a code survives being read aloud or typed from a screenshot.
@@ -31,6 +32,19 @@ function normalise(code: string) {
  */
 function displayName(identity: { name?: string; givenName?: string }, given?: string) {
   return (identity.name || identity.givenName || given?.trim() || 'Someone').slice(0, 80);
+}
+
+/**
+ * Sets a space's tally of members from who is actually there, after someone has gone.
+ * Counting again, not subtracting, also gives a tally to a space that never had one.
+ */
+async function recountMembers(ctx: MutationCtx, workspaceId: Id<'workspaces'>) {
+  const workspace = await ctx.db.get(workspaceId);
+  if (!workspace) return;
+  const members = await ctx.db.query('members')
+    .withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', workspaceId))
+    .take(MAX_MEMBERS);
+  await ctx.db.patch(workspaceId, { memberCount: members.length });
 }
 
 export const status = query({
@@ -81,7 +95,7 @@ export const disable = mutation({
       .withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', workspaceId))
       .take(MAX_MEMBERS);
     for (const member of members) await ctx.db.delete(member._id);
-    await ctx.db.patch(workspace._id, { shareCode: undefined });
+    await ctx.db.patch(workspace._id, { shareCode: undefined, memberCount: 0 });
     return null;
   },
 });
@@ -112,6 +126,7 @@ export const join = mutation({
     if (members.some(member => member.userId === identity.subject)) return result;
     if (members.length >= MAX_MEMBERS) fail('LIMIT_REACHED', 'This space is full.');
     await ctx.db.insert('members', { workspaceId: workspace._id, userId: identity.subject, name: displayName(identity, args.name), joinedAt: Date.now() });
+    await ctx.db.patch(workspace._id, { memberCount: members.length + 1 });
     return result;
   },
 });
@@ -124,7 +139,10 @@ export const leave = mutation({
     const member = await ctx.db.query('members')
       .withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', workspaceId).eq('userId', identity.subject))
       .unique();
-    if (member) await ctx.db.delete(member._id);
+    if (member) {
+      await ctx.db.delete(member._id);
+      await recountMembers(ctx, workspaceId);
+    }
     return null;
   },
 });
@@ -137,7 +155,10 @@ export const removeMember = mutation({
     const member = await ctx.db.query('members')
       .withIndex('by_workspaceId_and_userId', q => q.eq('workspaceId', workspaceId).eq('userId', userId))
       .unique();
-    if (member) await ctx.db.delete(member._id);
+    if (member) {
+      await ctx.db.delete(member._id);
+      await recountMembers(ctx, workspaceId);
+    }
     return null;
   },
 });

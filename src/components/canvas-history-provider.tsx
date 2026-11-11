@@ -16,6 +16,11 @@ export function useDraftRegistry() {
   if (!drafts) throw new Error('Drafts require their session provider.');
   return drafts;
 }
+/** The one draft store for an account's card, made the first time it is asked for. */
+export function getDraftStore(registry: Map<string, CardDraftStore>, key: string, make: () => CardDraftStore) {
+  if (!registry.has(key)) registry.set(key, make());
+  return registry.get(key)!;
+}
 export function useCanvasHistory(canvasId: string) {
   const histories = useHistoryRegistry();
   const history = getCanvasHistory(histories, canvasId);

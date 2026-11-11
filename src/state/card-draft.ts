@@ -14,11 +14,17 @@ export class CardDraftStore {
   private storageFailed = false;
   private hydration: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private writeTimer: ReturnType<typeof setTimeout> | null = null;
+  private unwritten: { draft: CardDraft; revision: number } | null = null;
   private writes: Promise<unknown> = Promise.resolve();
   private saves: Promise<boolean> = Promise.resolve(true);
   private listeners = new Set<() => void>();
   private snapshot: DraftSnapshot;
-  constructor(initial: CardDraft, private storage: Storage, private commit: (draft: CardDraft) => Promise<unknown>) {
+  /**
+   * `writeDelay` is how long typing must pause before the draft is copied to the device.
+   * Zero writes every edit at once. A save, or stopping the store, never waits for it.
+   */
+  constructor(initial: CardDraft, private storage: Storage, private commit: (draft: CardDraft) => Promise<unknown>, private writeDelay = 0) {
     this.draft = initial;
     this.snapshot = { draft: initial, status: 'saved', localSaved: false };
   }
@@ -26,7 +32,11 @@ export class CardDraftStore {
   getSnapshot = () => this.snapshot;
   setCommit(commit: (draft: CardDraft) => Promise<unknown>) { this.commit = commit; }
   private publish() {
-    this.snapshot = { draft: this.draft, status: this.dirty ? this.failed || this.storageFailed ? 'error' : 'saving' : 'saved', localSaved: this.dirty && this.stored === this.revision };
+    const status = this.dirty ? this.failed || this.storageFailed ? 'error' : 'saving' : 'saved';
+    const localSaved = this.dirty && this.stored === this.revision;
+    // Listeners render the whole editor, so they only hear about something they would show differently.
+    if (this.snapshot.draft === this.draft && this.snapshot.status === status && this.snapshot.localSaved === localSaved) return;
+    this.snapshot = { draft: this.draft, status, localSaved };
     this.listeners.forEach(listener => listener());
   }
   receiveServer(draft: CardDraft) {
@@ -37,6 +47,20 @@ export class CardDraftStore {
     this.timer = setTimeout(() => { void this.flush(); }, 600);
   }
   private persist(draft: CardDraft, revision: number) {
+    if (this.writeDelay <= 0) { this.write(draft, revision); return; }
+    this.unwritten = { draft, revision };
+    if (this.writeTimer) clearTimeout(this.writeTimer);
+    this.writeTimer = setTimeout(() => this.writeNow(), this.writeDelay);
+  }
+  /** Copies whatever typing is still waiting to the device, without waiting for a pause. */
+  private writeNow() {
+    if (this.writeTimer) clearTimeout(this.writeTimer);
+    this.writeTimer = null;
+    const waiting = this.unwritten;
+    this.unwritten = null;
+    if (waiting) this.write(waiting.draft, waiting.revision);
+  }
+  private write(draft: CardDraft, revision: number) {
     this.writes = this.writes.catch(() => {}).then(async () => {
       try { await this.storage.write(JSON.stringify(draft)); this.stored = revision; this.storageFailed = false; }
       catch { this.storageFailed = true; }
@@ -70,6 +94,7 @@ export class CardDraftStore {
     this.timer = null;
     if (!this.dirty || this.scheduled === this.revision) return this.saves;
     if (this.storageFailed) this.persist(this.draft, this.revision);
+    this.writeNow();
     const revision = this.revision;
     const draft = { ...this.draft, title: this.draft.title.trim() || 'Untitled' };
     const commit = this.commit;
@@ -92,5 +117,5 @@ export class CardDraftStore {
     });
     return this.saves;
   };
-  stop() { if (this.timer) clearTimeout(this.timer); this.timer = null; }
+  stop() { if (this.timer) clearTimeout(this.timer); this.timer = null; this.writeNow(); }
 }
