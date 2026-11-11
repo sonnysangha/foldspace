@@ -1,0 +1,153 @@
+# The main journey, start to finish: create a space, type a note in place, add a nested
+# space and a link, toggle the pen, find the note by searching from the library, then pin, delete and undo,
+# share it, and visit the You tab.
+# Start signed in, on the Spaces tab. Run sign-in.yaml first on a fresh device.
+appId: com.papareact.foldspace
+name: Core journey
+---
+# A name of its own each run, so an earlier run's leftovers can never be mistaken for it.
+- evalScript: ${output.space = 'Test ' + Date.now().toString(36)}
+- launchApp:
+    stopApp: false
+- assertVisible: "New space"
+
+# Create a space. The Create button sits in the sheet header, above the keyboard.
+- tapOn: "New space"
+- tapOn: "Name"
+- inputText: ${output.space}
+- tapOn: "Create"
+- assertVisible: "Empty canvas"
+- takeScreenshot: 01-empty-canvas
+# The sheet is still sliding away when the canvas appears; a tap during that is dropped.
+- extendedWaitUntil:
+    notVisible: "Create"
+    timeout: 5000
+- waitForAnimationToEnd
+
+# Add a note. It is typed straight onto the card; its title is selected, so typing replaces it.
+- tapOn: "Add a note"
+- inputText: "First idea"
+- assertVisible: "Delete card"
+- assertVisible: "Connect to another card"
+- takeScreenshot: 02-typing-on-the-note
+# A tap on empty canvas finishes typing and deselects.
+- tapOn:
+    point: "95%,22%"
+- assertNotVisible: "Delete card"
+- assertNotVisible: "Empty canvas"
+
+# The pen is a toggle. Its eraser and settings appear only while it is on.
+- assertNotVisible: "Erase ink"
+- tapOn: "Draw"
+- assertVisible: "Erase ink"
+- assertVisible: "One finger draws.*"
+- takeScreenshot: 03-draw-mode
+- tapOn: "Draw"
+- assertNotVisible: "Erase ink"
+
+# A space is a card you step into. It gets a title, then it is just a canvas.
+- tapOn: "Add"
+- tapOn: "Space"
+- inputText: "Inner space"
+- assertNotVisible: "Write something"
+- tapOn: "Open space"
+- assertVisible: "${output.space}, go back"
+- assertVisible: "Empty canvas"
+- takeScreenshot: 04-inside-space
+- waitForAnimationToEnd
+- tapOn:
+    id: "canvas-back"
+- waitForAnimationToEnd
+- tapOn: "Close"
+
+# A link is typed into a floating field and lands on the canvas.
+- tapOn: "Add"
+- tapOn: "Link"
+- inputText: "expo.dev"
+- tapOn: "Add expo.dev"
+
+# The card list is the readable view of the canvas. Choosing a card selects it on the canvas.
+- tapOn: "More"
+- tapOn: "Card list"
+- assertVisible: "3 cards"
+- assertVisible: "First idea.*"
+- assertVisible: "Inner space.*"
+- takeScreenshot: 05-card-list
+# The link's title and picture arrive a moment after the card and redraw its row, so let that finish.
+- waitForAnimationToEnd:
+    timeout: 4000
+- tapOn: ".*\\. Link\\..*"
+- tapOn: "Open card"
+- assertVisible: "Open link"
+- tapOn: "Close"
+
+# Back to the library, then search inside the space.
+- tapOn: "Back"
+# The newest space is at the top of the library.
+- scrollUntilVisible:
+    element: "Open ${output.space}"
+    direction: UP
+- takeScreenshot: 06-library
+
+# Search from the library looks inside every space.
+- scrollUntilVisible:
+    element: "Spaces and cards"
+    direction: UP
+- tapOn: "Spaces and cards"
+- inputText: "First"
+- assertVisible: "First idea, in ${output.space}"
+- takeScreenshot: 07-search
+
+# A result opens its canvas with the card open.
+- tapOn: "First idea, in ${output.space}"
+- assertVisible: "Delete card"
+- tapOn: "Close"
+- tapOn: "Back"
+- tapOn: "Close"
+
+# Holding a space's name offers its actions; holding its cover offers the same ones.
+- scrollUntilVisible:
+    element: "Open ${output.space}"
+    direction: DOWN
+- longPressOn: "Open ${output.space}"
+- takeScreenshot: 08-space-actions
+- tapOn: "Pin to top"
+- assertVisible: "Pinned to the top.*"
+
+# Delete is immediate; the message that says so can undo it.
+- scrollUntilVisible:
+    element: "Open ${output.space}"
+    direction: UP
+- longPressOn: "Open ${output.space}"
+- tapOn: "Delete"
+- assertVisible: "Deleted.*"
+- assertNotVisible: "Open ${output.space}"
+- tapOn: "Undo"
+- assertVisible: "Open ${output.space}"
+
+# Share it: an invite code appears. Closing the invite makes the code useless.
+- longPressOn: "Open ${output.space}"
+- tapOn: "Share"
+- tapOn: "Create an invite"
+- assertVisible: "Send invite"
+- assertVisible: "No one has joined yet."
+- takeScreenshot: 09-share
+- tapOn:
+    id: "share-disable"
+- tapOn: "Stop"
+- assertVisible: "Create an invite"
+- tapOn: "Done"
+
+# The You tab: the account, and the appearance switch.
+- tapOn: "You"
+- assertVisible: "Manage account.*"
+- tapOn: "Dark"
+- takeScreenshot: 10-you-dark
+- tapOn: "System"
+- tapOn: "Spaces"
+
+# Then delete it for good.
+- longPressOn: "Open ${output.space}"
+- tapOn: "Delete"
+- assertVisible: "Deleted.*"
+- assertNotVisible: "Open ${output.space}"

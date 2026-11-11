@@ -1,0 +1,24 @@
+# Signs in a Clerk development test account through the native sign-in screen.
+# Pass the account in, never store it here:
+#   maestro test -e EMAIL=you+clerk_test@example.com -e PASSWORD=... .maestro/sign-in.yaml
+# Addresses containing +clerk_test accept Clerk's fixed development code.
+appId: com.papareact.foldspace
+name: Sign in
+---
+- launchApp:
+    stopApp: false
+- assertVisible: "Enter your email"
+- tapOn: "Enter your email"
+- inputText: ${EMAIL}
+- tapOn: "Continue"
+- tapOn: "Enter your password"
+- inputText: ${PASSWORD}
+- tapOn: "Continue"
+- runFlow:
+    when:
+      visible: "Verification code"
+    commands:
+      - inputText: "424242"
+- extendedWaitUntil:
+    visible: "New space"
+    timeout: 30000

@@ -1,0 +1,27 @@
+# One-time setup for a freshly installed development build: connect it to Metro
+# and dismiss the developer menu's first-run screen. Release builds need none of this.
+# It also drags the floating developer button out of the top-right corner, where
+# it would cover "New space".
+appId: com.papareact.foldspace
+name: Prepare the development build
+---
+- launchApp
+- openLink: "foldspace://expo-development-client/?url=http%3A%2F%2Flocalhost%3A8081"
+- tapOn:
+    text: "Open"
+    optional: true
+- extendedWaitUntil:
+    visible: "Continue.*|New space"
+    timeout: 120000
+- runFlow:
+    when:
+      visible: "This is the developer menu.*"
+    commands:
+      - tapOn:
+          text: "Continue"
+          below: "This is the developer menu.*"
+      - tapOn: "Close"
+- swipe:
+    start: "95%, 5%"
+    end: "6%, 55%"
+    duration: 1500

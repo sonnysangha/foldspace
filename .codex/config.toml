@@ -1,0 +1,9 @@
+[mcp_servers.expo]
+url = "https://mcp.expo.dev/mcp"
+
+[mcp_servers.clerk_remote]
+url = "https://mcp.clerk.com/mcp"
+
+[mcp_servers.convex]
+command = "npx"
+args = ["--yes", "convex@latest", "mcp", "start"]

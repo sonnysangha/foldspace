@@ -1,0 +1,4 @@
+# Literal YOUR_SECRET_KEY examples in the unmodified, pinned Clerk skills.
+.agents/skills/clerk-chrome-extension-patterns/references/headless-extension.md:curl-auth-header:109
+.agents/skills/clerk-chrome-extension-patterns/references/sync-host.md:curl-auth-header:91
+.agents/skills/clerk-chrome-extension-patterns/SKILL.md:curl-auth-header:154
